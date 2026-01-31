@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/poshporo/Documents/etterna/extern/ffmpeg/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

@@ -67,6 +67,7 @@ add_subdirectory(mad-0.15.1b)
 add_subdirectory(fmt)
 add_subdirectory(boost/nowide)
 add_subdirectory(filesystem)
+add_subdirectory(ffmpeg)
 
 ## Vorbis depends on ogg
 add_subdirectory(newogg)
@@ -78,9 +79,6 @@ if(WITH_CRASHPAD)
     add_subdirectory(crashpad)
 endif()
 
-if(MSVC) # Only required on Windows
-    add_subdirectory(ffmpeg)
-endif()
 
 ## IDE Folder Organization
 list(APPEND EXT_TARGETS
@@ -88,7 +86,7 @@ list(APPEND EXT_TARGETS
     discord-rpc muFFT
     zlib libmad pcre
     ogg vorbis glfw
-    libcurl fmt)
+    libcurl fmt ffmpeg)
 
 list(APPEND LUA_TARGETS luajit libluajit minilua buildvm)
 

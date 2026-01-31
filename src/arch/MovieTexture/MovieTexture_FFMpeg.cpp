@@ -127,7 +127,7 @@ MovieDecoder_FFMpeg::MovieDecoder_FFMpeg()
 	m_fctx = NULL;
 	m_pStream = NULL;
 	m_iCurrentPacketOffset = -1;
-	m_Frame = avcodec::av_frame_alloc();
+	m_pFrame = avcodec::av_frame_alloc();
 
 	Init();
 }
@@ -141,11 +141,12 @@ void
 MovieDecoder_FFMpeg::Init()
 {
 	if (m_iCurrentPacketOffset != -1) {
-		avcodec::av_free_packet(&m_Packet);
+		avcodec::av_packet_unref(&m_Packet);
 		m_iCurrentPacketOffset = -1;
 	}
 
 	m_iEOF = 0;
+	m_pCodecContext = 0;
 	m_fTimestamp = 0;
 	m_fLastFrameDelay = 0;
 	m_iFrameNumber = -1; /* decode one frame and you're on the 0th */
@@ -154,6 +155,10 @@ MovieDecoder_FFMpeg::Init()
 	if (m_swsctx) {
 		avcodec::sws_freeContext(m_swsctx);
 		m_swsctx = NULL;
+	}
+	if (m_pCodecContext) {
+		avcodec::avcodec_free_context(&m_pCodecContext);
+
 	}
 	m_swsctx = NULL;
 	// Note: m_avioContext->buffer refers to m_buffer, but ffmpeg sometimes
@@ -221,13 +226,14 @@ MovieDecoder_FFMpeg::GetFrameDuration() const
 int
 MovieDecoder_FFMpeg::ReadPacket()
 {
+	int ret;
 	if (m_iEOF > 0)
 		return 0;
 
 	for (;;) {
 		if (m_iCurrentPacketOffset != -1) {
 			m_iCurrentPacketOffset = -1;
-			avcodec::av_free_packet(&m_Packet);
+			avcodec::av_packet_unref(&m_Packet);
 		}
 
 		int ret = avcodec::av_read_frame(m_fctx, &m_Packet);
@@ -242,11 +248,19 @@ MovieDecoder_FFMpeg::ReadPacket()
 
 		if (m_Packet.stream_index == m_pStream->index) {
 			m_iCurrentPacketOffset = 0;
+
+
+			// Send the packet to the decoder
+			ret = avcodec::avcodec_send_packet(m_pCodecContext, &m_Packet);
+			if ( ret < 0 ) {
+				Locator::getLogger()->warn("Error while sending a packet to the decoder\n");
+				return -1;
+			}
 			return 1;
 		}
 
 		/* It's not for the video stream; ignore it. */
-		avcodec::av_free_packet(&m_Packet);
+		avcodec::av_packet_unref(&m_Packet);
 	}
 }
 
@@ -255,6 +269,7 @@ MovieDecoder_FFMpeg::ReadPacket()
 int
 MovieDecoder_FFMpeg::DecodePacket(float fTargetTime)
 {
+	int ret;
 	if (m_iEOF == 0 && m_iCurrentPacketOffset == -1)
 		return 0; /* no packet */
 
@@ -271,31 +286,23 @@ MovieDecoder_FFMpeg::DecodePacket(float fTargetTime)
 		bool bSkipThisFrame =
 		  fTargetTime != -1 &&
 		  GetTimestamp() + GetFrameDuration() < fTargetTime &&
-		  (m_pStream->codec->frame_number % 2) == 0;
+		  (m_pCodecContext->frame_num % 2) == 0;
 
-		int iGotFrame;
-		/* Hack: we need to send size = 0 to flush frames at the end, but we
-		 * have to give it a buffer to read from since it tries to read anyway.
-		 */
-		m_Packet.data = m_Packet.size ? m_Packet.data : NULL;
-		int len = avcodec::avcodec_decode_video2(
-		  m_pStream->codec, m_Frame, &iGotFrame, &m_Packet);
 
-		if (len < 0) {
-			Locator::getLogger()->warn("avcodec_decode_video2: {}    ", len);
-			return -1; // XXX
-		}
-
-		m_iCurrentPacketOffset += len;
-
-		if (!iGotFrame) {
+		// Receive a from the decoder
+		ret = avcodec::avcodec_receive_frame(m_pCodecContext, m_pFrame);
+		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
 			if (m_iEOF == 1)
 				m_iEOF = 2;
 			continue;
+		} else if (ret < 0) {
+		    Locator::getLogger()->warn("Error while receiving frame from the decoder");
+			return -1;
 		}
 
-		if (m_Frame->pkt_dts != AV_NOPTS_VALUE) {
-			m_fTimestamp = static_cast<float>(m_Frame->pkt_dts *
+
+		if (m_pFrame->pkt_dts != AV_NOPTS_VALUE) {
+			m_fTimestamp = static_cast<float>(m_pFrame->pkt_dts *
 											  av_q2d(m_pStream->time_base));
 		} else {
 			/* If the timestamp is zero, this frame is to be played at the
@@ -305,7 +312,7 @@ MovieDecoder_FFMpeg::DecodePacket(float fTargetTime)
 
 		/* Length of this frame: */
 		m_fLastFrameDelay = static_cast<float>(av_q2d(m_pStream->time_base));
-		m_fLastFrameDelay += m_Frame->repeat_pict * (m_fLastFrameDelay * 0.5f);
+		m_fLastFrameDelay += m_pFrame->repeat_pict * (m_fLastFrameDelay * 0.5f);
 
 		++m_iFrameNumber;
 
@@ -334,9 +341,11 @@ MovieDecoder_FFMpeg::DecodePacket(float fTargetTime)
 void
 MovieDecoder_FFMpeg::GetFrame(RageSurface* pSurface)
 {
-	avcodec::AVPicture pict;
-	pict.data[0] = (unsigned char*)pSurface->pixels;
-	pict.linesize[0] = pSurface->pitch;
+	uint8_t *pict_data[4];
+	int32_t pict_linesize[4];
+	pict_data[0] = (unsigned char*)pSurface->pixels;
+	pict_linesize[0] = pSurface->pitch;
+	avcodec::AVPixelFormat pix_fmt = (avcodec::AVPixelFormat) m_pStream->codecpar->format;
 
 	/* XXX 1: Do this in one of the Open() methods instead?
 	 * XXX 2: The problem of doing this in Open() is that m_AVTexfmt is not
@@ -346,7 +355,7 @@ MovieDecoder_FFMpeg::GetFrame(RageSurface* pSurface)
 		m_swsctx = avcodec::sws_getCachedContext(m_swsctx,
 												 GetWidth(),
 												 GetHeight(),
-												 m_pStream->codec->pix_fmt,
+												 pix_fmt,
 												 GetWidth(),
 												 GetHeight(),
 												 m_AVTexfmt,
@@ -358,19 +367,19 @@ MovieDecoder_FFMpeg::GetFrame(RageSurface* pSurface)
 			Locator::getLogger()->warn("Cannot initialize sws conversion context for ({},{}) {}->{}",
 			  GetWidth(),
 			  GetHeight(),
-			  m_pStream->codec->pix_fmt,
+			  pix_fmt,
 			  m_AVTexfmt);
 			return;
 		}
 	}
 
 	avcodec::sws_scale(m_swsctx,
-					   m_Frame->data,
-					   m_Frame->linesize,
+					   m_pFrame->data,
+					   m_pFrame->linesize,
 					   0,
 					   GetHeight(),
-					   pict.data,
-					   pict.linesize);
+					   pict_data,
+					   pict_linesize);
 }
 
 static std::string
@@ -391,7 +400,7 @@ averr_ssprintf(int err, const char* fmt, ...)
 
 	return s + " (" + Error + ")";
 }
-
+/*
 void
 MovieTexture_FFMpeg::RegisterProtocols()
 {
@@ -402,7 +411,7 @@ MovieTexture_FFMpeg::RegisterProtocols()
 
 	avcodec::avcodec_register_all();
 	avcodec::av_register_all();
-}
+} */
 
 static int
 AVIORageFile_ReadPacket(void* opaque, uint8_t* buf, int buf_size)
@@ -429,8 +438,6 @@ AVIORageFile_Seek(void* opaque, int64_t offset, int whence)
 std::string
 MovieDecoder_FFMpeg::Open(const std::string& sFile)
 {
-	MovieTexture_FFMpeg::RegisterProtocols();
-
 	Close();
 
 	m_fctx = avcodec::avformat_alloc_context();
@@ -476,16 +483,14 @@ MovieDecoder_FFMpeg::Open(const std::string& sFile)
 		return "Couldn't find any video streams";
 	m_pStream = m_fctx->streams[stream_idx];
 
-	if (m_pStream->codec->codec_id == avcodec::CODEC_ID_NONE)
-		return ssprintf("Unsupported codec %08x", m_pStream->codec->codec_tag);
+	if (m_pStream->codecpar->codec_id == avcodec::AV_CODEC_ID_NONE)
+		return ssprintf("Unsupported codec");
 
 	std::string sError = OpenCodec();
 	if (!sError.empty())
 		return ssprintf("AVCodec (%s): %s", sFile.c_str(), sError.c_str());
 
-	Locator::getLogger()->debug("Bitrate: {}", m_pStream->codec->bit_rate);
-	Locator::getLogger()->debug("Codec pixel format: {}",
-			   avcodec::av_get_pix_fmt_name(m_pStream->codec->pix_fmt));
+	Locator::getLogger()->debug("Bitrate: {}", m_pStream->codecpar->bit_rate);
 
 	return std::string();
 }
@@ -493,8 +498,9 @@ MovieDecoder_FFMpeg::Open(const std::string& sFile)
 std::string
 MovieDecoder_FFMpeg::OpenCodec()
 {
+	int ret;
 	if (m_iCurrentPacketOffset != -1) {
-		avcodec::av_free_packet(&m_Packet);
+		avcodec::av_packet_unref(&m_Packet);
 		m_iCurrentPacketOffset = -1;
 	}
 
@@ -506,28 +512,30 @@ MovieDecoder_FFMpeg::OpenCodec()
 	m_fLastFrame = 0;
 
 	ASSERT(m_pStream != NULL);
-	if (m_pStream->codec->codec)
-		avcodec::avcodec_close(m_pStream->codec);
+	if (m_pCodecContext != 0)
+		avcodec::avcodec_free_context(&m_pCodecContext);
 
-	avcodec::AVCodec* pCodec =
-	  avcodec::avcodec_find_decoder(m_pStream->codec->codec_id);
+	const avcodec::AVCodec* pCodec =
+	  avcodec::avcodec_find_decoder(m_pStream->codecpar->codec_id);
 	if (pCodec == NULL)
-		return ssprintf("Couldn't find decoder %i", m_pStream->codec->codec_id);
+		return ssprintf("Couldn't find decoder %i", m_pStream->codecpar->codec_id);
 
-	m_pStream->codec->workaround_bugs = 1;
-	m_pStream->codec->idct_algo = FF_IDCT_AUTO;
-	m_pStream->codec->error_concealment = 3;
-
-	if (pCodec->capabilities & CODEC_CAP_DR1)
-		m_pStream->codec->flags |= CODEC_FLAG_EMU_EDGE;
+	m_pCodecContext = avcodec::avcodec_alloc_context3(pCodec);
+	if (m_pCodecContext == NULL)
+		return ssprintf("Couldnt alloc context");
+	m_pCodecContext->workaround_bugs = 1;
+	m_pCodecContext->idct_algo = FF_IDCT_AUTO;
+	m_pCodecContext->error_concealment = 3;
 
 	Locator::getLogger()->trace("Opening codec {}", pCodec->name);
 
-	int ret = avcodec::avcodec_open2(m_pStream->codec, pCodec, NULL);
+	if ((ret = avcodec::avcodec_parameters_to_context(m_pCodecContext, m_pStream->codecpar)) < 0)
+		return ssprintf("Failed to turn parameters into context");
+
+	ret = avcodec::avcodec_open2(m_pCodecContext, pCodec, NULL);
 	if (ret < 0)
 		return std::string(
 		  averr_ssprintf(ret, "Couldn't open codec \"%s\"", pCodec->name));
-	ASSERT(m_pStream->codec->codec != NULL);
 
 	return std::string();
 }
@@ -535,8 +543,8 @@ MovieDecoder_FFMpeg::OpenCodec()
 void
 MovieDecoder_FFMpeg::Close()
 {
-	if (m_pStream && m_pStream->codec->codec) {
-		avcodec::avcodec_close(m_pStream->codec);
+	if (m_pStream && m_pCodecContext->codec) {
+		avcodec::avcodec_free_context(&m_pCodecContext);
 		m_pStream = NULL;
 	}
 

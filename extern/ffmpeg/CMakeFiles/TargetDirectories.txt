@@ -1,0 +1,2 @@
+/home/poshporo/Documents/etterna/extern/ffmpeg/CMakeFiles/edit_cache.dir
+/home/poshporo/Documents/etterna/extern/ffmpeg/CMakeFiles/rebuild_cache.dir
