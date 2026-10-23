@@ -9,6 +9,7 @@
 #include "Etterna/Models/Misc/LocalizedString.h"
 
 #include "RageUtil/Graphics/RageDisplay_OGL_Helpers.h"
+#include <EGL/egl.h>
 using namespace RageDisplay_Legacy_Helpers;
 using namespace X11Helper;
 
@@ -33,6 +34,14 @@ const std::string ID_XSCREEN = "XSCREEN_RANDR";
 
 static GLXContext g_pContext = NULL;
 static GLXContext g_pBackgroundContext = NULL;
+
+/* TODO: Do we need this here? */
+static EGLConfig egl_config;
+
+static EGLSurface egl_surface = EGL_NO_SURFACE;
+static EGLContext egl_context = EGL_NO_CONTEXT;
+static EGLDisplay egl_display = EGL_NO_DISPLAY;
+
 static Window g_AltWindow = None;
 static bool g_bChangedScreenSize = false;
 static SizeID g_iOldSize = None;
@@ -60,6 +69,8 @@ NetWMSupported(Display* Dpy, Atom feature);
 static LocalizedString FAILED_CONNECTION_XSERVER(
   "LowLevelWindow_X11",
   "Failed to establish a connection with the X server");
+
+/* TODO: Figure out what needs to happen here to have it agnostic */
 LowLevelWindow_X11::LowLevelWindow_X11()
 {
 	if (!OpenXConnection())
@@ -91,15 +102,20 @@ LowLevelWindow_X11::LowLevelWindow_X11()
 	iXServerVersion %= 1000;
 	int iPatch = iXServerVersion;
 
-	Locator::getLogger()->info("Display: {} (screen {})", DisplayString(Dpy), iScreen);
+	Locator::getLogger()->info(
+	  "Display: {} (screen {})", DisplayString(Dpy), iScreen);
 	Locator::getLogger()->info("X server vendor: {} [{}.{}.{}.{}]",
-			  XServerVendor(Dpy), iMajor, iMinor, iRevision, iPatch);
+							   XServerVendor(Dpy),
+							   iMajor,
+							   iMinor,
+							   iRevision,
+							   iPatch);
 	Locator::getLogger()->info("Server GLX vendor: {} [{}]",
-			  glXQueryServerString(Dpy, iScreen, GLX_VENDOR),
-			  glXQueryServerString(Dpy, iScreen, GLX_VERSION));
+							   glXQueryServerString(Dpy, iScreen, GLX_VENDOR),
+							   glXQueryServerString(Dpy, iScreen, GLX_VERSION));
 	Locator::getLogger()->info("Client GLX vendor: {} [{}]",
-			  glXGetClientString(Dpy, GLX_VENDOR),
-			  glXGetClientString(Dpy, GLX_VERSION));
+							   glXGetClientString(Dpy, GLX_VENDOR),
+							   glXGetClientString(Dpy, GLX_VERSION));
 	m_bWasWindowed = true;
 	g_pScreenConfig =
 	  XRRGetScreenInfo(Dpy, RootWindow(Dpy, DefaultScreen(Dpy)));
@@ -108,23 +124,30 @@ LowLevelWindow_X11::LowLevelWindow_X11()
 LowLevelWindow_X11::~LowLevelWindow_X11()
 {
 	// Reset the display
-	if (!m_bWasWindowed) {
-		RestoreOutputConfig();
-		XUngrabKeyboard(Dpy, CurrentTime);
+	//
+	// TODO: Figure out if this is needed
+	//
+	// if (!m_bWasWindowed) {
+	// 	RestoreOutputConfig();
+	// 	XUngrabKeyboard(Dpy, CurrentTime);
+	// }
+
+	if (egl_surface != EGL_NO_SURFACE) {
+		eglDestroySurface(egl_display, egl_surface);
 	}
-	if (g_pContext) {
-		glXDestroyContext(Dpy, g_pContext);
-		g_pContext = NULL;
+	if (egl_context != EGL_NO_CONTEXT) {
+		eglDestroyContext(egl_display, egl_context);
 	}
-	if (g_pBackgroundContext) {
-		glXDestroyContext(Dpy, g_pBackgroundContext);
-		g_pBackgroundContext = NULL;
+	if (egl_display != EGL_NO_DISPLAY) {
+		eglTerminate(egl_display);
 	}
-	XDestroyWindow(Dpy, Win);
-	Win = None;
-	XDestroyWindow(Dpy, g_AltWindow);
-	g_AltWindow = None;
-	CloseXConnection();
+
+	/* TODO: Dont know if I need this yet */
+	// XDestroyWindow(Dpy, Win);
+	// Win = None;
+	// XDestroyWindow(Dpy, g_AltWindow);
+	// g_AltWindow = None;
+	// CloseXConnection();
 }
 
 /*
@@ -176,8 +199,9 @@ LowLevelWindow_X11::GetProcAddress(const std::string& s)
 std::string
 LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 {
-	// We're going to be interested in MapNotify/ConfigureNotify events in this
-	// routine, so ensure our event mask includes these, restore it on exit
+	// We're going to be interested in MapNotify/ConfigureNotify events in
+	// this routine, so ensure our event mask includes these, restore it on
+	// exit
 	XWindowAttributes winAttrib;
 	auto restore = [&](XWindowAttributes* attr) {
 		XSelectInput(Dpy, Win, attr->your_event_mask);
@@ -185,7 +209,8 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 	auto restoreAttrib = std::unique_ptr<XWindowAttributes, decltype(restore)>(
 	  &winAttrib, restore);
 
-	// These might change if we're rendering at different resolution than window
+	// These might change if we're rendering at different resolution than
+	// window
 	int windowWidth = p.width;
 	int windowHeight = p.height;
 	bool renderOffscreen = false;
@@ -227,8 +252,9 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 		if (xvi == NULL)
 			return "No visual available for that depth.";
 
-		// I get strange behavior if I add override redirect after creating the
-		// window. So, let's recreate the window when changing that state.
+		// I get strange behavior if I add override redirect after creating
+		// the window. So, let's recreate the window when changing that
+		// state.
 		if (!MakeWindow(Win,
 						xvi->screen,
 						xvi->depth,
@@ -282,14 +308,15 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 			XWindowEvent(Dpy, Win, StructureNotifyMask, &ev);
 		} while (ev.type != MapNotify);
 
-		// I can't find official docs saying what happens if you re-init GLEW.
-		// I'll just assume the behavior is undefined.
+		// I can't find official docs saying what happens if you re-init
+		// GLEW. I'll just assume the behavior is undefined.
 		if (bFirstRun) {
 			GLenum err = glewInit();
 			ASSERT(err == GLEW_OK);
 		}
 	} else {
-		// We're remodeling the existing window, and not touching the context.
+		// We're remodeling the existing window, and not touching the
+		// context.
 		bNewDeviceOut = false;
 
 		XGetWindowAttributes(Dpy, Win, &winAttrib);
@@ -300,11 +327,11 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 
 		if (!p.windowed) {
 			// X11 is an asynchronous beast. If we're resizing an existing
-			// window directly (i.e. override-redirect as opposed to asking the
-			// WM to do it) and don't wait for the window to actually be
-			// resized, we'll get unexpected results from glViewport() etc. I
-			// don't know why, or why it *doesn't* break in the slower process
-			// of waiting for the WM to resize the window.
+			// window directly (i.e. override-redirect as opposed to asking
+			// the WM to do it) and don't wait for the window to actually be
+			// resized, we'll get unexpected results from glViewport() etc.
+			// I don't know why, or why it *doesn't* break in the slower
+			// process of waiting for the WM to resize the window.
 
 			// So, set the event mask so we're notified when the window is
 			// resized... Send the resize command...
@@ -313,8 +340,8 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 						  static_cast<unsigned int>(p.width),
 						  static_cast<unsigned int>(p.height));
 
-			// We'll wait for the notification once we've done everything else,
-			// to save time.
+			// We'll wait for the notification once we've done everything
+			// else, to save time.
 		}
 	}
 
@@ -324,8 +351,9 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 		RestoreOutputConfig();
 
 		if (p.sDisplayId == ID_XSCREEN || p.sDisplayId.empty()) {
-			// If the user changed the resolution while StepMania was windowed
-			// we overwrite the resolution to restore with it at exit.
+			// If the user changed the resolution while StepMania was
+			// windowed we overwrite the resolution to restore with it at
+			// exit.
 			g_iOldSize =
 			  XRRConfigCurrentConfiguration(g_pScreenConfig, &g_OldRotation);
 			m_bWasWindowed = false;
@@ -367,10 +395,11 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 
 			XRaiseWindow(Dpy, Win);
 
-			// We want to prevent the WM from catching anything that comes from
-			// the keyboard. We should do this every time on fullscreen and not
-			// only we entering from windowed mode because we could lose focus
-			// at resolution change and that will leave the user input locked.
+			// We want to prevent the WM from catching anything that comes
+			// from the keyboard. We should do this every time on fullscreen
+			// and not only we entering from windowed mode because we could
+			// lose focus at resolution change and that will leave the user
+			// input locked.
 			while (XGrabKeyboard(
 			  Dpy, Win, True, GrabModeAsync, GrabModeAsync, CurrentTime))
 				;
@@ -380,8 +409,8 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 			/* === Configuring a specific CRTC === */
 			// Arcane and undocumented but PROPER XRandR 1.2 method.
 			// What we do is directly reconfigure the CRTC of the primary
-			// display, Which prevents the (RandR) screen itself from resizing,
-			// and therefore leaving user's desktop unmolested.
+			// display, Which prevents the (RandR) screen itself from
+			// resizing, and therefore leaving user's desktop unmolested.
 			Locator::getLogger()->info("LowLevelWindow_X11: Using XRandR");
 
 			XRRScreenResources* scrRes = XRRGetScreenResources(Dpy, Win);
@@ -408,18 +437,19 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 				}
 			}
 			if (targetOut == None) {
-				Locator::getLogger()->info("Did not find display output {}, trying another",
-						  p.sDisplayId.c_str());
-				// didn't find named output, pick primary/or at least one that
-				// works
+				Locator::getLogger()->info(
+				  "Did not find display output {}, trying another",
+				  p.sDisplayId.c_str());
+				// didn't find named output, pick primary/or at least one
+				// that works
 				if (g_iRandRVerMajor >= 1 && g_iRandRVerMinor >= 3) {
 					// RandR 1.3 can tell us what the primary display is.
 					targetOut = XRRGetOutputPrimary(Dpy, Win);
 				} else {
-					// Only RandR 1.2. We'll look for a "Connected" output, or
-					// if we can't find that, (it is possible the connection
-					// state could be unknown), we'll at least look for an
-					// output with a CRTC driving it
+					// Only RandR 1.2. We'll look for a "Connected" output,
+					// or if we can't find that, (it is possible the
+					// connection state could be unknown), we'll at least
+					// look for an output with a CRTC driving it
 					RROutput connected = None, hasCrtc = None;
 					for (unsigned int i = 0; i < scrRes->noutput; ++i) {
 						XRROutputInfo* outInfo =
@@ -466,9 +496,9 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 			float fRefreshDiff = 99999;
 			float fRefreshRate = 0;
 			RRMode mode = None;
-			// A quirk of XRandR is that the width and height are as the display
-			// controller ("CRTC") sees it, which means height and width are
-			// flipped if there's rotation going on.
+			// A quirk of XRandR is that the width and height are as the
+			// display controller ("CRTC") sees it, which means height and
+			// width are flipped if there's rotation going on.
 			const bool bPortrait =
 			  (oldConf->rotation & (RR_Rotate_90 | RR_Rotate_270)) != 0;
 			// Find a mode that matches our exact wanted resolution,
@@ -509,11 +539,12 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 
 			const std::string tgtOutName = std::string(
 			  tgtOutInfo->name, static_cast<unsigned int>(tgtOutInfo->nameLen));
-			Locator::getLogger()->info("XRandR output config using CRTC {} in mode {}, "
-					  "driving output %s",
-					  g_usedCrtc,
-					  mode,
-					  tgtOutName.c_str());
+			Locator::getLogger()->info(
+			  "XRandR output config using CRTC {} in mode {}, "
+			  "driving output %s",
+			  g_usedCrtc,
+			  mode,
+			  tgtOutName.c_str());
 			// and FIRE!
 			Status s = XRRSetCrtcConfig(Dpy,
 										scrRes,
@@ -532,9 +563,9 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 				return "Failed to set CRTC config";
 			}
 
-			// We don't move to absolute 0,0 because that may be in the area of
-			// a different output. Instead we preserved the corner of our CRTC;
-			// go to that.
+			// We don't move to absolute 0,0 because that may be in the area
+			// of a different output. Instead we preserved the corner of our
+			// CRTC; go to that.
 			XMoveWindow(Dpy, Win, oldConf->x, oldConf->y);
 
 			// Final cleanup
@@ -546,17 +577,18 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 
 		XRaiseWindow(Dpy, Win);
 
-		// We want to prevent the WM from catching anything that comes from the
-		// keyboard. We should do this every time on fullscreen and not only we
-		// entering from windowed mode because we could lose focus at resolution
-		// change and that will leave the user input locked.
+		// We want to prevent the WM from catching anything that comes from
+		// the keyboard. We should do this every time on fullscreen and not
+		// only we entering from windowed mode because we could lose focus
+		// at resolution change and that will leave the user input locked.
 		while (XGrabKeyboard(
 		  Dpy, Win, True, GrabModeAsync, GrabModeAsync, CurrentTime))
 			;
 	} else // if(p.windowed)
 	{
 		if (!m_bWasWindowed) {
-			// Return the display to the mode it was in before we fullscreened.
+			// Return the display to the mode it was in before we
+			// fullscreened.
 			RestoreOutputConfig();
 			XUngrabKeyboard(Dpy, CurrentTime);
 			m_bWasWindowed = true;
@@ -571,8 +603,8 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 		  XInternAtom(Dpy, "_NET_WM_STATE_MAXIMIZED_HORZ", False);
 		// if FSBW, find matching monitor, move window to its origin,
 		// then set fullscreen hint, and set the CurrentParams.outWidth,
-		// CurrentParams.outHeight to the values of that display otherwise set
-		// the size hints and disable MAXIMIZED_*
+		// CurrentParams.outHeight to the values of that display otherwise
+		// set the size hints and disable MAXIMIZED_*
 		if (p.bWindowIsFullscreenBorderless) {
 			auto specs = DisplaySpecs{};
 			GetDisplaySpecs(specs);
@@ -581,16 +613,16 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 				  return p.sDisplayId == spec.id() &&
 						 spec.currentMode() != nullptr;
 			  });
-			// If we didn't find a matching DisplaySpec for the requested ID,
-			// pick the first one with a current mode
+			// If we didn't find a matching DisplaySpec for the requested
+			// ID, pick the first one with a current mode
 			if (target == specs.end()) {
 				target = std::find_if(
 				  specs.begin(), specs.end(), [&](const DisplaySpec& spec) {
 					  return spec.currentMode() != nullptr;
 				  });
 			}
-			// If we _still_ haven't found anything (unlikely), then just give
-			// up
+			// If we _still_ haven't found anything (unlikely), then just
+			// give up
 			if (target == specs.end()) {
 				return "Unable to find destination monitor for fullscreen "
 					   "borderless";
@@ -606,10 +638,11 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 			// Reset anything that might've been set previously:
 			// (1) Undo Min/Max size bounds
 			// (2) Remove FULLSCREEN/MAXIMIZED_{HORIZ,VERT} hints
-			// Without doing this, WM may not let us move/resize window to new
-			// display Give Window manager the chance to react to changes
-			// (otherwise, Mutter had problems properly reacting to moving a
-			// _NET_WM_STATE_FULLSCREEN window to a different output
+			// Without doing this, WM may not let us move/resize window to
+			// new display Give Window manager the chance to react to
+			// changes (otherwise, Mutter had problems properly reacting to
+			// moving a _NET_WM_STATE_FULLSCREEN window to a different
+			// output
 			//   and fullscreen resetting FULLSCREEN hint.
 			XSizeHints hints;
 			hints.flags = 0;
@@ -643,8 +676,8 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 
 			SetWMState(winAttrib.root, Win, 0, fullscreen_state);
 			// Make a window fixed size, don't let resize it or maximize it.
-			// Do this before resizing the window so that pane-style WMs (Ion,
-			// ratpoison) don't resize us back inappropriately.
+			// Do this before resizing the window so that pane-style WMs
+			// (Ion, ratpoison) don't resize us back inappropriately.
 			{
 				XSizeHints hints;
 
@@ -655,18 +688,19 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 
 				XSetWMNormalHints(Dpy, Win, &hints);
 			}
-			/* Workaround for metacity and compiz: if the window have the same
-			 * resolution or higher than the screen, it gets automaximized even
-			 * when the window is set to not let it happen. This happens when
-			 * changing from fullscreen to window mode and our screen resolution
-			 * is bigger. */
+			/* Workaround for metacity and compiz: if the window have the
+			 * same resolution or higher than the screen, it gets
+			 * automaximized even when the window is set to not let it
+			 * happen. This happens when changing from fullscreen to window
+			 * mode and our screen resolution is bigger. */
 			{
 				SetWMState(winAttrib.root, Win, 1, maximized_vert);
 				SetWMState(winAttrib.root, Win, 1, maximized_horz);
 
-				// This one is needed for compiz, if the window reaches out of
-				// bounds of the screen it becames destroyed, only the window,
-				// the program is left running. Commented out per the patch at
+				// This one is needed for compiz, if the window reaches out
+				// of bounds of the screen it becames destroyed, only the
+				// window, the program is left running. Commented out per
+				// the patch at
 				// http://ssc.ajworld.net/sm-ssc/bugtracker/view.php?id=398
 				// XMoveWindow( Dpy, Win, 0, 0 );
 			}
@@ -682,15 +716,15 @@ LowLevelWindow_X11::TryVideoMode(const VideoModeParams& p, bool& bNewDeviceOut)
 
 	if (!p.windowed) {
 		// Set our V-sync hint.
-		if (GLXEW_EXT_swap_control) // I haven't seen this actually implemented
-									// yet, but why not.
+		if (GLXEW_EXT_swap_control) // I haven't seen this actually
+									// implemented yet, but why not.
 			glXSwapIntervalEXT(Dpy, Win, CurrentParams.vsync ? 1 : 0);
-			// XXX: These two might be server-global. I should look into whether
-			// to try to preserve the original value on exit.
+		// XXX: These two might be server-global. I should look into whether
+		// to try to preserve the original value on exit.
 #ifdef GLXEW_MESA_swap_control // Added in 1.7. 1.6 is still common out there
 							   // apparently.
-		else if (GLXEW_MESA_swap_control) // Haven't seen this NOT implemented
-										  // yet
+		else if (GLXEW_MESA_swap_control) // Haven't seen this NOT
+										  // implemented yet
 			glXSwapIntervalMESA(CurrentParams.vsync ? 1 : 0);
 #endif
 		else if (GLXEW_SGI_swap_control) // But old GLEW.
@@ -708,14 +742,16 @@ LowLevelWindow_X11::Update()
 	XEvent event;
 	if (XCheckTypedEvent(Dpy, ClientMessage, &event) &&
 		event.xclient.data.l[0] == g_wmDeleteMessage) {
-	    GameLoop::setUserQuit();
+		GameLoop::setUserQuit();
 	}
 }
 
 void
 LowLevelWindow_X11::LogDebugInformation() const
 {
-	Locator::getLogger()->info("Direct rendering: {}", glXIsDirect(Dpy, glXGetCurrentContext()) ? "yes" : "no");
+	Locator::getLogger()->info("Direct rendering: {}",
+							   glXIsDirect(Dpy, glXGetCurrentContext()) ? "yes"
+																		: "no");
 }
 
 bool
@@ -739,16 +775,16 @@ LowLevelWindow_X11::SwapBuffers()
 		// This causes flicker.
 		// XForceScreenSaver( Dpy, ScreenSaverReset );
 
-		/* Instead, send a null relative mouse motion, to trick X into thinking
-		 * there has been user activity.
+		/* Instead, send a null relative mouse motion, to trick X into
+		 * thinking there has been user activity.
 		 *
-		 * This also handles XScreenSaver; XForceScreenSaver only handles the
-		 * internal X11 screen blanker.
+		 * This also handles XScreenSaver; XForceScreenSaver only handles
+		 * the internal X11 screen blanker.
 		 *
-		 * This will delay the X blanker, DPMS and XScreenSaver from activating,
-		 * and will disable the blanker and XScreenSaver if they're already
-		 * active (unless XSS is locked). For some reason, it doesn't un-blank
-		 * DPMS if it's already active.
+		 * This will delay the X blanker, DPMS and XScreenSaver from
+		 * activating, and will disable the blanker and XScreenSaver if
+		 * they're already active (unless XSS is locked). For some reason,
+		 * it doesn't un-blank DPMS if it's already active.
 		 */
 
 		XLockDisplay(Dpy);
@@ -783,10 +819,10 @@ LowLevelWindow_X11::GetDisplaySpecs(DisplaySpecs& out) const
 	XRRScreenConfiguration* screenConf = XRRGetScreenInfo(Dpy, Win);
 	const short curRate = XRRConfigCurrentRate(screenConf);
 	SizeID curSizeId = XRRConfigCurrentConfiguration(screenConf, &curRotation);
-	// curRotation does not factor into how we report supported XScreen sizes:
-	// XRR reports the supported *screen* sizes with height/width swapped
-	// appropriately for currently configured rotation. Supported sizes for
-	// *output* modes (below) DO NOT account for screen rotation
+	// curRotation does not factor into how we report supported XScreen
+	// sizes: XRR reports the supported *screen* sizes with height/width
+	// swapped appropriately for currently configured rotation. Supported
+	// sizes for *output* modes (below) DO NOT account for screen rotation
 
 	std::set<DisplayMode> screenModes;
 	int nsizes = 0;
@@ -812,15 +848,15 @@ LowLevelWindow_X11::GetDisplaySpecs(DisplaySpecs& out) const
 	  ID_XSCREEN, "X Screen", screenModes, screenCurMode, screenBounds, true);
 	out.insert(screenSpec);
 	// XRRScreenSize array from XRRSizes does *not* have to be returned
-	// (valgrind said XFree was an invalid free in a small test program, there
-	// is no XRRFreeScreenSize, etc)
+	// (valgrind said XFree was an invalid free in a small test program,
+	// there is no XRRFreeScreenSize, etc)
 	XRRFreeScreenConfigInfo(screenConf);
 
 	if (g_bUseXRandR12) {
 		// Build per-output DisplaySpecs
 
-		// First, get the list of resolutions that'll be referenced (by RRMode)
-		// in each OutputInfo
+		// First, get the list of resolutions that'll be referenced (by
+		// RRMode) in each OutputInfo
 		XRRScreenResources* scrRes = XRRGetScreenResources(Dpy, Win);
 		std::map<RRMode, DisplayMode> outputModes;
 		for (unsigned int i = 0; i < scrRes->nmode; ++i) {
@@ -837,8 +873,8 @@ LowLevelWindow_X11::GetDisplaySpecs(DisplaySpecs& out) const
 			XRROutputInfo* outInfo =
 			  XRRGetOutputInfo(Dpy, scrRes, scrRes->outputs[outIdx]);
 			if (outInfo->nmode > 0) {
-				// Get the current configuration of the Output, if it's being
-				// driven by a crtc
+				// Get the current configuration of the Output, if it's
+				// being driven by a crtc
 				RRMode curRRMode = None;
 				bool bPortrait = false;
 				int crtcX = 0, crtcY = 0;
@@ -952,8 +988,8 @@ RenderTarget_X11::Create(const RenderTargetParam& param,
 						 int& iTextureWidthOut,
 						 int& iTextureHeightOut)
 {
-	// ASSERT( param.iWidth == power_of_two(param.iWidth) && param.iHeight ==
-	// power_of_two(param.iHeight) );
+	// ASSERT( param.iWidth == power_of_two(param.iWidth) && param.iHeight
+	// == power_of_two(param.iHeight) );
 
 	m_iWidth = param.iWidth;
 	m_iHeight = param.iHeight;
@@ -1005,7 +1041,8 @@ RenderTarget_X11::Create(const RenderTargetParam& param,
 	glGenTextures(1, reinterpret_cast<GLuint*>(&m_iTexHandle));
 	glBindTexture(GL_TEXTURE_2D, m_iTexHandle);
 
-	Locator::getLogger()->trace("n {}, {}x{}", m_iTexHandle, param.iWidth, param.iHeight);
+	Locator::getLogger()->trace(
+	  "n {}, {}x{}", m_iTexHandle, param.iWidth, param.iHeight);
 	while (glGetError() != GL_NO_ERROR)
 		;
 
